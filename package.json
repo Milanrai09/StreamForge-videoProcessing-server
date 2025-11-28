@@ -1,0 +1,17 @@
+{
+  "name": "video-processing-pipeline",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "express": "^5.1.0",
+    "fs-extra": "^11.3.2",
+    "node-fetch": "^3.3.2",
+    "uuid": "^13.0.0"
+  }
+}
