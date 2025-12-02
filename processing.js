@@ -7,10 +7,14 @@ import path from "path";
 import os from "os";
 import { v4 as uuidv4 } from "uuid";
 
+
+
+
+
 const s3 = new S3Client({ region: process.env.AWS_REGION });
 const bucket = process.env.S3_BUCKET;
-const key = process.env.S3_KEY;
 const backendUrl = process.env.BACKEND_URL;
+const videoUrl = process.env.VIDEO_URL; // New: download URL from .env
 
 const TMP_ROOT = path.join(os.tmpdir(), 'transcode-' + uuidv4());
 const OUTPUT_DIR = path.join(TMP_ROOT, 'outputs');
@@ -81,17 +85,45 @@ async function listFiles(dir) {
   return files;
 }
 
+// ============= VALIDATION =============
+
+async function validateEnvironment() {
+  const required = ['AWS_REGION', 'S3_BUCKET', 'BACKEND_URL', 'VIDEO_URL'];
+  const missing = required.filter(v => !process.env[v]);
+  
+  if (missing.length > 0) {
+    throw new Error(`Missing environment variables: ${missing.join(', ')}`);
+  }
+
+  // Check if ffmpeg and ffprobe are available
+  try {
+    await runCmd('ffmpeg', ['-version']);
+    await runCmd('ffprobe', ['-version']);
+  } catch (err) {
+    throw new Error('ffmpeg or ffprobe not found. Please install FFmpeg.');
+  }
+}
+
 // ============= S3 OPERATIONS =============
 
 async function downloadVideo() {
-  console.log("⬇️ Downloading video from S3:", bucket, key);
+  console.log("⬇️ Downloading video from URL:", videoUrl);
   await fs.ensureDir(TMP_ROOT);
   
-  const command = new GetObjectCommand({ Bucket: bucket, Key: key });
-  const obj = await s3.send(command);
+  const response = await fetch(videoUrl);
+  if (!response.ok) {
+    throw new Error(`Failed to download video: ${response.statusText}`);
+  }
+
   const localPath = path.join(TMP_ROOT, "input.mp4");
   const fileStream = fs.createWriteStream(localPath);
-  await new Promise((resolve) => obj.Body.pipe(fileStream).on("finish", resolve));
+  
+  await new Promise((resolve, reject) => {
+    response.body.pipe(fileStream);
+    fileStream.on('finish', resolve);
+    fileStream.on('error', reject);
+    response.body.on('error', reject);
+  });
   
   console.log("✓ Download complete:", localPath);
   return localPath;
@@ -122,14 +154,10 @@ async function transcodeH264Rendition(inputPath, rendition, outDir) {
     '-i', inputPath,
     '-c:v', 'libx264',
     '-b:v', rendition.bitrate,
-    '-vf', `scale=w=${rendition.width}:h=${rendition.height}:force_original_aspect_ratio=decrease`,
+    '-vf', `scale=${rendition.width}:${rendition.height}:force_original_aspect_ratio=decrease:force_divisible_by=2`,
     '-preset', 'fast',
-    '-x264-params', 'keyint=48:min-keyint=48:no-scenecut',
-    '-g', '48',
-    '-sc_threshold', '0',
     '-c:a', 'aac',
     '-b:a', rendition.audio_bitrate,
-    '-ac', '2',
     '-hls_time', '6',
     '-hls_playlist_type', 'vod',
     '-hls_segment_filename', segmentPattern,
@@ -148,53 +176,20 @@ async function transcodeH264Rendition(inputPath, rendition, outDir) {
   };
 }
 
-async function transcodeVP9Rendition(inputPath, rendition, outDir) {
-  const name = rendition.name;
-  const playlist = path.join(outDir, `${name}_vp9.m3u8`);
-  const segmentPattern = path.join(outDir, `${name}_vp9_%03d.webm`);
-
-  const args = [
-    '-y',
-    '-i', inputPath,
-    '-c:v', 'libvpx-vp9',
-    '-b:v', rendition.bitrate,
-    '-vf', `scale=w=${rendition.width}:h=${rendition.height}:force_original_aspect_ratio=decrease`,
-    '-c:a', 'libopus',
-    '-b:a', rendition.audio_bitrate,
-    '-f', 'segment',
-    '-segment_time', '6',
-    '-segment_list', playlist,
-    '-segment_list_type', 'flat',
-    '-reset_timestamps', '1',
-    segmentPattern
-  ];
-
-  console.log(`🎞 Transcoding ${name} (VP9)...`);
-  await runCmd('ffmpeg', args);
+async function generateMasterPlaylist(renditionInfos, outDir) {
+  const masterPath = path.join(outDir, 'master.m3u8');
+  let content = '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n\n';
   
-  return {
-    playlist,
-    name: `${name}_vp9`,
-    codec: 'vp9',
-    bandwidth: Math.floor(rendition.bandwidth * 0.7), // VP9 is more efficient
-    resolution: `${rendition.width}x${rendition.height}`
-  };
-}
-
-async function generateMasterPlaylist(renditionInfos, outDir, codec) {
-  // Create separate master playlists for H.264 and VP9
-  const masterPath = path.join(outDir, `master_${codec}.m3u8`);
-  let content = '#EXTM3U\n#EXT-X-VERSION:3\n\n';
+  // Sort by bandwidth ascending for proper adaptive streaming
+  const sorted = [...renditionInfos].sort((a, b) => a.bandwidth - b.bandwidth);
   
-  const codecRenditions = renditionInfos.filter(r => r.codec === codec);
-  
-  for (const r of codecRenditions) {
-    content += `#EXT-X-STREAM-INF:BANDWIDTH=${r.bandwidth},RESOLUTION=${r.resolution},CODECS="${codec === 'h264' ? 'avc1.640028,mp4a.40.2' : 'vp09.00.41.08,opus'}"\n`;
+  for (const r of sorted) {
+    content += `#EXT-X-STREAM-INF:BANDWIDTH=${r.bandwidth},RESOLUTION=${r.resolution},CODECS="avc1.640028,mp4a.40.2"\n`;
     content += `${path.basename(r.playlist)}\n\n`;
   }
   
   await fs.writeFile(masterPath, content, 'utf8');
-  console.log(`✓ Master playlist created: ${codec}`);
+  console.log('✓ Master playlist created');
   return masterPath;
 }
 
@@ -204,20 +199,30 @@ async function generateThumbnails(inputPath, outDir) {
 
   console.log('🖼 Generating thumbnails...');
   
-  // Get video duration
   const duration = await probeDuration(inputPath);
   
-  // Generate thumbnail at 1s
-  const thumb1 = path.join(thumbsDir, 'thumb_01.jpg');
-  await runCmd('ffmpeg', ['-y', '-ss', '00:00:01', '-i', inputPath, '-frames:v', '1', '-q:v', '2', thumb1]);
+  if (duration < 4) {
+    console.log('⚠️ Video is too short for full thumbnail coverage, adjusting...');
+  }
 
-  // Generate thumbnails at 10%, 50%, 90% of duration
-  const offsets = [0.1, 0.5, 0.9].map(f => Math.max(1, Math.floor(duration * f)));
-  const thumbs = [thumb1];
-  
-  for (let i = 0; i < offsets.length; i++) {
-    const out = path.join(thumbsDir, `thumb_0${i + 2}.jpg`);
-    await runCmd('ffmpeg', ['-y', '-ss', `${offsets[i]}`, '-i', inputPath, '-frames:v', '1', '-q:v', '2', out]);
+  const thumbs = [];
+  const timestamps = [
+    1, // 1 second
+    Math.max(2, Math.floor(duration * 0.25)), // 25%
+    Math.max(3, Math.floor(duration * 0.50)), // 50%
+    Math.max(4, Math.floor(duration * 0.75))  // 75%
+  ];
+
+  for (let i = 0; i < timestamps.length; i++) {
+    const out = path.join(thumbsDir, `thumb_${String(i + 1).padStart(2, '0')}.jpg`);
+    await runCmd('ffmpeg', [
+      '-y',
+      '-ss', `${timestamps[i]}`,
+      '-i', inputPath,
+      '-frames:v', '1',
+      '-q:v', '2',
+      out
+    ]);
     thumbs.push(out);
   }
   
@@ -235,31 +240,22 @@ async function processVideo(inputPath) {
   const duration = await probeDuration(inputPath);
   console.log(`Video duration: ${duration.toFixed(2)}s`);
 
-  // Transcode all renditions (both H.264 and VP9)
   const renditionInfos = [];
   
   for (const r of RENDITIONS) {
     const h264Info = await transcodeH264Rendition(inputPath, r, OUTPUT_DIR);
     renditionInfos.push(h264Info);
-    
-    const vp9Info = await transcodeVP9Rendition(inputPath, r, OUTPUT_DIR);
-    renditionInfos.push(vp9Info);
   }
 
-  // Generate master playlists for each codec
-  await generateMasterPlaylist(renditionInfos, OUTPUT_DIR, 'h264');
-  await generateMasterPlaylist(renditionInfos, OUTPUT_DIR, 'vp9');
-
-  // Generate thumbnails
+  await generateMasterPlaylist(renditionInfos, OUTPUT_DIR);
   await generateThumbnails(inputPath, OUTPUT_DIR);
 
-  console.log("✅ All renditions, master playlists, and thumbnails generated");
+  console.log("✅ All renditions, master playlist, and thumbnails generated");
   return { outputDir: OUTPUT_DIR, renditionInfos };
 }
 
 async function uploadAllFiles() {
-  const processedBaseKey = key.replace("raw/", "processed/");
-  const baseFolder = path.basename(processedBaseKey, path.extname(processedBaseKey));
+  const baseFolder = 'video_' + uuidv4().substring(0, 8);
   
   console.log("⬆️ Uploading all processed files to S3...");
   
@@ -288,31 +284,33 @@ async function uploadAllFiles() {
 async function updateDatabase(uploadedFiles) {
   console.log("🔁 Updating backend database...");
   
-  // Find important files
-  const masterH264 = uploadedFiles.find(f => f.key.includes('master_h264.m3u8'));
-  const masterVP9 = uploadedFiles.find(f => f.key.includes('master_vp9.m3u8'));
+  const masterPlaylist = uploadedFiles.find(f => f.key.includes('master.m3u8'));
   const thumbnails = uploadedFiles.filter(f => f.key.includes('thumbnails/'));
-  const playlists = uploadedFiles.filter(f => f.key.endsWith('.m3u8'));
   
-  await fetch(`${backendUrl}/api/update-db`, {
+  if (!masterPlaylist) {
+    throw new Error('Master playlist not found in uploaded files');
+  }
+
+  const response = await fetch(`${backendUrl}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      originalKey: key,
-      masterPlaylists: {
-        h264: masterH264?.url,
-        vp9: masterVP9?.url
-      },
+      masterPlaylist: masterPlaylist.url,
       thumbnails: thumbnails.map(t => t.url),
-      playlists: playlists.map(p => ({ url: p.url, key: p.key })),
       allFiles: uploadedFiles,
       totalFiles: uploadedFiles.length,
       status: "processed",
       processedAt: new Date().toISOString()
     }),
   });
-  
-  console.log("✓ Database updated");
+
+  if (!response.ok) {
+    throw new Error(`Backend update failed: ${response.statusText}`);
+  }
+
+  const result = await response.json();
+  console.log("✓ Database updated successfully");
+  return result;
 }
 
 // ============= MAIN EXECUTION =============
@@ -323,6 +321,9 @@ async function updateDatabase(uploadedFiles) {
   try {
     console.log("🚀 Starting complete video processing pipeline");
     console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    
+    // Validate environment
+    await validateEnvironment();
     
     // Step 1: Download
     const inputPath = await downloadVideo();
@@ -344,9 +345,9 @@ async function updateDatabase(uploadedFiles) {
     console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     console.log(`✅ Pipeline complete in ${duration}s`);
     console.log(`📊 Total files: ${uploadedFiles.length}`);
-    console.log(`📹 Renditions: 8 (4 resolutions × 2 codecs)`);
+    console.log(`📹 Renditions: 4 (4 resolutions × H.264)`);
     console.log(`🖼️ Thumbnails: 4`);
-    console.log(`🎯 Master playlists: 2 (H.264 + VP9)`);
+    console.log(`🎯 Master playlist: 1`);
     
   } catch (err) {
     console.error("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");

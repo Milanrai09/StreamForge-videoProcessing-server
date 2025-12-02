@@ -29,11 +29,12 @@ ENV FFMPEG_PATH=/usr/bin/ffmpeg
 ENV FFPROBE_PATH=/usr/bin/ffprobe
 
 # Expose port (if running as API)
-EXPOSE 3000
+EXPOSE 8000
 
 # Health check (optional)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD node -e "console.log('healthy')" || exit 1
 
 # Run the processor
-CMD ["node", "processor.js"]
+CMD ["node", "processing.js"]
+
