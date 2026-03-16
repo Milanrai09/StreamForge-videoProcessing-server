@@ -1,0 +1,20 @@
+{
+  "name": "video-processing-pipeline",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.940.0",
+    "@openai/codex": "^0.101.0",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "fs-extra": "^11.3.2",
+    "node-fetch": "^3.3.2",
+    "uuid": "^13.0.0"
+  }
+}
