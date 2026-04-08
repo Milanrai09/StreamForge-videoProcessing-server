@@ -1,6 +1,7 @@
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import fs from "fs/promises";
 import { createWriteStream } from "fs";
+import { Writable } from "stream";
 import { spawn } from "child_process";
 import path from "path";
 import os from "os";
@@ -18,9 +19,9 @@ const OUTPUT_DIR = path.join(TMP_ROOT, "outputs");
 
 const RENDITIONS = [
   { name: "1080p", width: 1920, height: 1080, bitrate: "5000k", audio_bitrate: "128k", bandwidth: 6000000 },
-  { name: "720p", width: 1280, height: 720, bitrate: "3000k", audio_bitrate: "128k", bandwidth: 3500000 },
-  { name: "480p", width: 854, height: 480, bitrate: "1000k", audio_bitrate: "96k", bandwidth: 1400000 },
-  { name: "360p", width: 640, height: 360, bitrate: "600k", audio_bitrate: "64k", bandwidth: 800000 },
+  { name: "720p",  width: 1280, height: 720,  bitrate: "3000k", audio_bitrate: "128k", bandwidth: 3500000 },
+  { name: "480p",  width: 854,  height: 480,  bitrate: "1000k", audio_bitrate: "96k",  bandwidth: 1400000 },
+  { name: "360p",  width: 640,  height: 360,  bitrate: "600k",  audio_bitrate: "64k",  bandwidth: 800000  },
 ];
 
 function runCmd(cmd, args, opts = {}) {
@@ -58,10 +59,10 @@ function probeDuration(inputPath) {
 function mimeTypeForPath(p) {
   const ext = path.extname(p).toLowerCase();
   if (ext === ".m3u8") return "application/vnd.apple.mpegurl";
-  if (ext === ".ts") return "video/mp2t";
+  if (ext === ".ts")   return "video/mp2t";
   if (ext === ".webm") return "video/webm";
   if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
-  if (ext === ".mp4") return "video/mp4";
+  if (ext === ".mp4")  return "video/mp4";
   return "application/octet-stream";
 }
 
@@ -91,6 +92,10 @@ async function validateEnvironment() {
   await runCmd("ffprobe", ["-version"]);
 }
 
+// ── FIXED: native fetch returns a WHATWG ReadableStream which does not have
+//    .pipe(). Use .pipeTo() with Writable.toWeb() for streaming, or fall back
+//    to arrayBuffer() for simplicity. We use the streaming path here so large
+//    files are never fully buffered in RAM.
 async function downloadVideo() {
   console.log("Downloading video from URL:", videoUrl);
   await ensureDir(TMP_ROOT);
@@ -103,12 +108,7 @@ async function downloadVideo() {
   const localPath = path.join(TMP_ROOT, "input.mp4");
   const fileStream = createWriteStream(localPath);
 
-  await new Promise((resolve, reject) => {
-    response.body.pipe(fileStream);
-    fileStream.on("finish", resolve);
-    fileStream.on("error", reject);
-    response.body.on("error", reject);
-  });
+  await response.body.pipeTo(Writable.toWeb(fileStream));
 
   return localPath;
 }
@@ -175,7 +175,7 @@ async function generateMasterPlaylist(renditionInfos, outDir) {
 
   const sorted = [...renditionInfos].sort((a, b) => a.bandwidth - b.bandwidth);
   for (const r of sorted) {
-    content += `#EXT-X-STREAM-INF:BANDWIDTH=${r.bandwidth},RESOLUTION=${r.resolution},CODECS=\"avc1.640028,mp4a.40.2\"\n`;
+    content += `#EXT-X-STREAM-INF:BANDWIDTH=${r.bandwidth},RESOLUTION=${r.resolution},CODECS="avc1.640028,mp4a.40.2"\n`;
     content += `${path.basename(r.playlist)}\n\n`;
   }
 
@@ -230,7 +230,6 @@ async function processVideo(inputPath) {
 async function uploadAllFiles() {
   const basePrefix = `${processedPrefix}/${namespace}`;
 
-  // Explicitly create namespace/directory in S3 before file uploads.
   await createS3NamespacePrefix(basePrefix);
 
   const files = await listFiles(OUTPUT_DIR);
@@ -242,6 +241,7 @@ async function uploadAllFiles() {
     const contentType = mimeTypeForPath(localPath);
     const url = await uploadToS3(localPath, s3Key, contentType);
     uploadedFiles.push({ key: s3Key, url, type: contentType });
+    console.log(`Uploaded: ${s3Key}`);
   }
 
   return uploadedFiles;
