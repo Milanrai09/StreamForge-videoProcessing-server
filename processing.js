@@ -35,6 +35,28 @@ function runCmd(cmd, args, opts = {}) {
   });
 }
 
+function probeResolution(inputPath) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      "-v", "error",
+      "-select_streams", "v:0",
+      "-show_entries", "stream=width,height",
+      "-of", "csv=s=x:p=0",
+      inputPath,
+    ];
+    const p = spawn("ffprobe", args, { stdio: ["ignore", "pipe", "inherit"] });
+    let out = "";
+    p.stdout.on("data", (b) => (out += b.toString()));
+    p.on("error", reject);
+    p.on("close", (code) => {
+      if (code !== 0) return reject(new Error("ffprobe resolution check failed"));
+      const [w, h] = out.trim().split("x").map(Number);
+      if (!w || !h) return reject(new Error("could not parse resolution"));
+      resolve({ width: w, height: h });
+    });
+  });
+}
+
 function probeDuration(inputPath) {
   return new Promise((resolve, reject) => {
     const args = [
@@ -92,24 +114,43 @@ async function validateEnvironment() {
   await runCmd("ffprobe", ["-version"]);
 }
 
-// ── FIXED: native fetch returns a WHATWG ReadableStream which does not have
-//    .pipe(). Use .pipeTo() with Writable.toWeb() for streaming, or fall back
-//    to arrayBuffer() for simplicity. We use the streaming path here so large
-//    files are never fully buffered in RAM.
 async function downloadVideo() {
   console.log("Downloading video from URL:", videoUrl);
   await ensureDir(TMP_ROOT);
 
   const response = await fetch(videoUrl);
   if (!response.ok) {
-    throw new Error(`Failed to download video: ${response.status} ${response.statusText}`);
+    const body = await response.text();
+    throw new Error(`Failed to download video: ${response.status} ${response.statusText}\n${body}`);
+  }
+
+  const contentType = response.headers.get("content-type") || "";
+
+  // S3 presigned URLs for missing/wrong keys return XML even with a 200 status.
+  // Catch that before writing anything to disk.
+  if (contentType.includes("application/xml") || contentType.includes("text/xml")) {
+    const body = await response.text();
+    throw new Error(`S3 returned an XML response instead of a video — likely an invalid key or directory URL.\nContent-Type: ${contentType}\nBody: ${body}`);
+  }
+
+  if (!contentType.includes("video") && !contentType.includes("octet-stream")) {
+    const body = await response.text();
+    throw new Error(`Unexpected content-type "${contentType}". Response body:\n${body}`);
   }
 
   const localPath = path.join(TMP_ROOT, "input.mp4");
   const fileStream = createWriteStream(localPath);
-
   await response.body.pipeTo(Writable.toWeb(fileStream));
 
+  // Ensure the file is large enough to be a real video (at least 100 KB).
+  // A truncated download or an S3 error page saved as .mp4 would be tiny.
+  const { size } = await fs.stat(localPath);
+  if (size < 100 * 1024) {
+    const sample = await fs.readFile(localPath, "utf8").catch(() => "<binary>");
+    throw new Error(`Downloaded file is suspiciously small (${size} bytes) — likely not a valid video.\nFirst bytes: ${sample.slice(0, 300)}`);
+  }
+
+  console.log(`Download complete: ${(size / 1024 / 1024).toFixed(2)} MB`);
   return localPath;
 }
 
@@ -218,8 +259,22 @@ async function processVideo(inputPath) {
   const duration = await probeDuration(inputPath);
   console.log(`Video duration: ${duration.toFixed(2)}s`);
 
+  // Only transcode renditions at or below the source resolution.
+  // Upscaling manufactures no new detail and wastes CPU/storage.
+  const { height: sourceHeight } = await probeResolution(inputPath);
+  console.log(`Source resolution height: ${sourceHeight}px`);
+
+  const applicableRenditions = RENDITIONS.filter((r) => r.height <= sourceHeight);
+  if (applicableRenditions.length === 0) {
+    throw new Error(
+      `Source height (${sourceHeight}px) is below the lowest rendition (${RENDITIONS.at(-1).height}px). ` +
+      "Add a lower-resolution rendition or check the source file."
+    );
+  }
+  console.log(`Transcoding ${applicableRenditions.length} rendition(s): ${applicableRenditions.map((r) => r.name).join(", ")}`);
+
   const renditionInfos = [];
-  for (const r of RENDITIONS) {
+  for (const r of applicableRenditions) {
     renditionInfos.push(await transcodeH264Rendition(inputPath, r, OUTPUT_DIR));
   }
 
